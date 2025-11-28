@@ -2,7 +2,7 @@ from vllm import LLM, SamplingParams
 from typing import Callable, List
 import json
 import os
-from drgrpo_grader import r1_zero_reward_fn
+from drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 
@@ -18,18 +18,7 @@ def load_data(data_file: str):
     return validation_data
 
 def format_r1_zero_prompt(question: str) -> str:
-    prompt_template = """请严格按照以下格式解决数学问题：
-
-<think>
-在这里展示您的逐步推理过程。请仔细思考每一步。
-</think>
-<answer>
-在这里只放置最终答案，不要包含任何其他文字。
-</answer>
-
-问题：{question}
-
-请确保使用 <think> 和 <answer> 标签！这是必须的格式要求。"""
+    prompt_template = """{question}"""
 
     return prompt_template.format(question=question)
 
@@ -61,9 +50,9 @@ def evaluate_vllm(
     for i, output in enumerate(tqdm(outputs)):
         generated_text = output.outputs[0].text
         # answer = extract_final_answer(generated_text)
-        # print("======================================8888888888888888")
-        # print(generated_text)
-        # print("======================================8888888888888888")
+        print("======================================8888888888888888")
+        print(generated_text)
+        print("======================================8888888888888888")
         ground_truth = ground_truths[i]
         reward_result = reward_fn(generated_text, ground_truth)
         result = {
@@ -162,7 +151,7 @@ if __name__ == '__main__':
 
     # 5. 执行评估
     print("Starting evaluation...")
-    evaluate_vllm(llm, reward_fn=r1_zero_reward_fn, prompts=prompts, ground_truths=ground_truths, eval_sampling_params=sampling_params)
+    evaluate_vllm(llm, reward_fn=question_only_reward_fn, prompts=prompts, ground_truths=ground_truths, eval_sampling_params=sampling_params)
 
 
 
