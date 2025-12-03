@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
-
+from torch.utils.data import DataLoader, Dataset
 
 def run_tokenize_prompt_and_output(
     prompt_strs: list[str],
@@ -775,7 +775,80 @@ def get_packed_sft_dataset(
         "input_ids" contains the token IDs for the language modeling inputs, and "labels" contains
         the token IDs for the language modeling labels.
     """
-    raise NotImplementedError
+
+    class PackedSFTDataset(torch.utils.data.Dataset):
+        def __init__(self, tokenizer, dataset_path, seg_len, shuffle=True):
+            self.tokenizer = tokenizer
+            self.dataset_path = dataset_path
+            self.seg_len = seg_len
+
+            import json
+            import random
+            with open(dataset_path, "r", encoding="utf-8") as f:
+                examples = [json.loads(line) for line in f]
+            if shuffle:
+                random.shuffle(examples)
+
+            # Alpaca模板 输入 (prompt, response) 开始输出 response
+            template = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n{response}"
+
+            bos_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
+            eos_token_id = tokenizer.eos_token_id
+
+            # 将文档合并为单一序列
+            self.all_token_ids = []
+
+            for i, example in enumerate(examples):
+                # 1. 格式化文本
+                formatted_text = template.format(instruction=example["prompt"], response=example["response"])
+                # 2，tokenization
+                tokens = self.tokenizer(formatted_text, add_special_tokens=False)["input_ids"]
+
+                # 添加 bos
+                if bos_token_id is not None:
+                    self.all_token_ids.append(bos_token_id)
+
+                self.all_token_ids.extend(tokens)
+
+                # 添加 eos
+                if eos_token_id is not None:
+                    self.all_token_ids.append(eos_token_id)
+
+                self.sequences = []
+
+            total_tokens = len(self.all_token_ids)
+
+            i = 0
+            while i + self.seg_len <= total_tokens:
+                chunk = self.all_token_ids[i:i + self.seg_len]
+                self.sequences.append(chunk)
+                i += self.seg_len
+
+        def __len__(self):
+            return len(self.sequences)
+
+        def __getitem__(self, idx):
+            sequence = self.sequences[idx]
+            input_ids = torch.tensor(sequence, dtype=torch.long)
+
+            if idx < len(self.sequences) - 1:
+                next_sequence = self.sequences[idx + 1]
+                labels = torch.tensor(sequence[1:] + [next_sequence[0]], dtype=torch.long)
+            else:
+                start_pos = idx * self.seg_len
+                end_pos = start_pos + self.seg_len
+
+                if end_pos < len(self.all_token_ids):
+                    next_token = self.all_token_ids[end_pos]
+                    labels = torch.tensor(sequence[1:] + [next_token], dtype=torch.long)
+                else:
+                    labels = torch.tensor(sequence[1:] + [-100], dtype=torch.long)
+
+            return {
+                "input_ids": input_ids,
+                "labels": labels,
+            }
+    return PackedSFTDataset(tokenizer, dataset_path, seg_len=seq_length, shuffle=shuffle)
 
 
 def run_iterate_batches(
@@ -798,7 +871,30 @@ def run_iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    raise NotImplementedError
+
+    def iterate_batches(
+            dataset: Dataset,
+            batch_size: int,
+            shuffle: bool,
+    ):
+        """
+        Given a PyTorch Dataset, return an iterable over batches of size `batch_size`.
+        Iterating through the returned iterable should constitute one epoch over the Dataset.
+
+        Args:
+            dataset: Dataset
+                Dataset to emit batches from.
+            batch_size: int
+                Number of examples to include per batch.
+            shuffle: bool
+                If true, shuffle examples before batching them.
+
+        Returns:
+            Iterable over batches, where each batch has size `batch_size`.
+        """
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+    return iterate_batches(dataset, batch_size, shuffle)
 
 
 def run_parse_mmlu_response(
@@ -824,7 +920,39 @@ def run_parse_mmlu_response(
         str (one of "A", "B", "C", or "D") if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    import re
+    def parse_mmlu_response(
+            mmlu_example: dict[str, Any],
+            model_output: str,
+    ) -> str | None:
+        """
+        Given an MMLU example and a model output, parse the model output into a
+        predicted option letter (i.e., 'A', 'B', 'C', or 'D'). If the model output
+        cannot be parsed into a prediction option letter, return None.
+
+        mmlu_example: dict[str, Any]
+            Dictionary with an MMLU example. Contains the following keys:
+            - "subject": str with the subject of the question.
+            - "question": str with the text of the question.
+            - "options": list[str] with the four answer options (in order).
+                         The first option refers to letter "A", the second to "B", etc.
+            - "answer": str with the option of the correct answer (e.g., "A")
+        model_output: str
+            str with the model's output to the MMLU example.
+
+        Returns:
+            str (one of "A", "B", "C", or "D") if the model output can be parsed into a prediction,
+            else None.
+        """
+        pattern = r"The correct answer is\s+([ABCD])"
+        match = re.search(pattern, model_output, re.IGNORECASE)
+
+        if match:
+            return match.group(1).upper()
+
+        return None
+
+    return parse_mmlu_response(mmlu_example, model_output)
 
 
 def run_parse_gsm8k_response(
@@ -841,7 +969,32 @@ def run_parse_gsm8k_response(
         str with the predicted numeric answer if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+
+    def parse_gsm8k_response(
+            model_output: str,
+    ) -> str | None:
+        """
+        Given a GSM8K model output, parse the model output into a predicted numeric answer by
+        taking the last number that occurs in the output.
+
+        model_output: str
+            str with the model's output to a GSM8K example.
+
+        Returns:
+            str with the predicted numeric answer if the model output can be parsed into a prediction,
+            else None.
+        """
+        import re
+        pattern = r'\d+(?:\.\d+)?'
+        matches = re.findall(pattern, model_output)
+
+        # 如果找到数字，返回最后一个
+        if matches:
+            return matches[-1]
+
+        return None
+
+    return parse_gsm8k_response(model_output)
 
 
 def run_compute_per_instance_dpo_loss(
@@ -876,4 +1029,92 @@ def run_compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    raise NotImplementedError
+
+    def compute_per_instance_dpo_loss(
+            lm: torch.nn.Module,
+            lm_ref: torch.nn.Module,
+            tokenizer: PreTrainedTokenizerBase,
+            beta: float,
+            prompt: str,
+            response_chosen: str,
+            response_rejected: str,
+    ) -> torch.Tensor:
+        """
+        Given two language models (`lm`, and the "reference model" `lm_ref`),
+        their tokenizer, the DPO beta hyperparameter, a prompt and a pair
+        of responses to the prompt, computes the value of the DPO loss for this example.
+
+        lm: torch.nn.Module
+            Language model being trained.
+        lm_ref: torch.nn.Module
+            Reference language model.
+        tokenizer: PreTrainedTokenizerBase
+            Tokenizer for both language models.
+        beta: float
+            DPO beta hyperparameter.
+        prompt: str
+            Prompt for this instance of preference pair.
+        response_chosen: str
+            Preferred response to the prompt.
+        response_rejected: str
+            Rejected response to the prompt.
+
+        Returns:
+            torch.Tensor with the DPO loss for this example.
+        """
+        template = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n{response}"
+        lm.eval()
+        lm_ref.eval()
+
+        eos_token = tokenizer.eos_token
+        if isinstance(eos_token, list):
+            eos_token = eos_token[0]
+
+        text_chosen = template.format(instruction=prompt, response=response_chosen) + eos_token
+        text_rejected = template.format(instruction=prompt, response=response_rejected) + eos_token
+
+        tokens_chosen = tokenizer(text_chosen, return_tensors="pt", add_special_tokens=False)["input_ids"]
+        tokens_rejected = tokenizer(text_rejected, return_tensors="pt", add_special_tokens=False)["input_ids"]
+
+        if tokens_chosen.dim > 1:
+            token_chosen = tokens_chosen.squeeze(0)  # [seq_len]
+        if tokens_rejected.dim > 1:
+            tokens_rejected = tokens_rejected.squeeze(0)
+
+        with torch.no_grad():
+            logits_lm_chosen = lm(tokens_chosen.unsqueeze(0)).logits.squeeze(
+                0)  # [1, seq_len]->[1, seq_len, vocab_size]->[seq_len, vocab_size]
+            logits_lm_rejected = lm(tokens_rejected.unsqueeze(0)).logits.squeeze(0)
+            logits_ref_chosen = lm_ref(tokens_chosen.unsqueeze(0)).logits.squeeze(0)
+            logits_ref_rejected = lm_ref(tokens_rejected.unsqueeze(0)).logits.squeeze(0)
+
+        log_probs_lm_chosen = torch.log_softmax(logits_lm_chosen, dim=-1)
+        log_probs_lm_rejected = torch.log_softmax(logits_lm_rejected, dim=-1)
+        log_probs_ref_chosen = torch.log_softmax(logits_ref_chosen, dim=-1)
+        log_probs_ref_rejected = torch.log_softmax(logits_ref_rejected, dim=-1)
+
+        target_chosen_ids = tokens_chosen[1:]
+        target_rejected_ids = tokens_rejected[1:]
+
+        log_probs_lm_chosen = torch.gather(log_probs_lm_chosen, dim=-1, index=target_chosen_ids.unsqueeze(-1)).squeeze(
+            -1)
+        log_probs_ref_chosen = torch.gather(log_probs_ref_chosen, dim=-1,
+                                            index=target_chosen_ids.unsqueeze(-1)).squeeze(-1)
+        log_probs_lm_rejected = torch.gather(log_probs_lm_rejected, dim=-1,
+                                             index=target_rejected_ids.unsqueeze(-1)).squeeze(-1)
+        log_probs_ref_rejected = torch.gather(logits_ref_rejected, dim=-1,
+                                              index=target_rejected_ids.unsqueeze(-1)).squeeze(-1)
+
+        log_probs_lm_chosen = log_probs_lm_chosen.sum()
+        log_probs_lm_rejected = log_probs_lm_rejected.sum()
+        log_probs_ref_chosen = log_probs_ref_chosen.sum()
+        log_probs_ref_rejected = log_probs_ref_rejected.sum()
+
+        log_ratio_chosen = log_probs_lm_chosen - log_probs_ref_chosen
+        log_ratio_rejected = log_probs_lm_rejected - log_probs_ref_rejected
+        import torch.nn.functional as F
+        loss = -F.logsigmoid(beta * (log_ratio_chosen - log_ratio_rejected))
+
+        return loss
+
+    return compute_per_instance_dpo_loss(lm, lm_ref, tokenizer, beta, prompt, response_chosen, response_rejected)

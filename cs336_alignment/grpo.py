@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing import Callable, Optional, Iterable, Tuple, Union, Literal
+import torch.nn.functional as F
 
 def compute_group_normalized_rewards(
     reward_fn: Callable,
@@ -312,3 +313,84 @@ def grpo_microbatch_train_step(
 
     return loss, metadata
 
+def compute_per_instance_dpo_loss(
+    lm: torch.nn.Module,
+    lm_ref: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    beta: float,
+    prompt: str,
+    response_chosen: str,
+    response_rejected: str,
+) -> torch.Tensor:
+    """
+    Given two language models (`lm`, and the "reference model" `lm_ref`),
+    their tokenizer, the DPO beta hyperparameter, a prompt and a pair
+    of responses to the prompt, computes the value of the DPO loss for this example.
+
+    lm: torch.nn.Module
+        Language model being trained.
+    lm_ref: torch.nn.Module
+        Reference language model.
+    tokenizer: PreTrainedTokenizerBase
+        Tokenizer for both language models.
+    beta: float
+        DPO beta hyperparameter.
+    prompt: str
+        Prompt for this instance of preference pair.
+    response_chosen: str
+        Preferred response to the prompt.
+    response_rejected: str
+        Rejected response to the prompt.
+
+    Returns:
+        torch.Tensor with the DPO loss for this example.
+    """
+    template = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n{response}"
+    lm.eval()
+    lm_ref.eval()
+
+    eos_token = tokenizer.eos_token
+    if isinstance(eos_token, list):
+        eos_token = eos_token[0]
+
+    text_chosen = template.format(instruction=prompt, response=response_chosen) + eos_token
+    text_rejected = template.format(instruction=prompt, response=response_rejected) + eos_token
+
+    tokens_chosen = tokenizer(text_chosen, return_tensors="pt", add_special_tokens=False)["input_ids"]
+    tokens_rejected = tokenizer(text_rejected, return_tensors="pt", add_special_tokens=False)["input_ids"]
+
+    if tokens_chosen.dim > 1:
+        token_chosen = tokens_chosen.squeeze(0)  # [seq_len]
+    if tokens_rejected.dim > 1:
+        tokens_rejected = tokens_rejected.squeeze(0)
+
+    with torch.no_grad():
+        logits_lm_chosen = lm(tokens_chosen.unsqueeze(0)).logits.squeeze(0)  # [1, seq_len]->[1, seq_len, vocab_size]->[seq_len, vocab_size]
+        logits_lm_rejected = lm(tokens_rejected.unsqueeze(0)).logits.squeeze(0)
+        logits_ref_chosen = lm_ref(tokens_chosen.unsqueeze(0)).logits.squeeze(0)
+        logits_ref_rejected = lm_ref(tokens_rejected.unsqueeze(0)).logits.squeeze(0)
+
+    log_probs_lm_chosen = torch.log_softmax(logits_lm_chosen, dim=-1)
+    log_probs_lm_rejected = torch.log_softmax(logits_lm_rejected, dim=-1)
+    log_probs_ref_chosen = torch.log_softmax(logits_ref_chosen, dim=-1)
+    log_probs_ref_rejected = torch.log_softmax(logits_ref_rejected, dim=-1)
+
+    target_chosen_ids = tokens_chosen[1:]
+    target_rejected_ids = tokens_rejected[1:]
+
+    log_probs_lm_chosen = torch.gather(log_probs_lm_chosen, dim=-1, index=target_chosen_ids.unsqueeze(-1)).squeeze(-1)
+    log_probs_ref_chosen = torch.gather(log_probs_ref_chosen, dim=-1, index=target_chosen_ids.unsqueeze(-1)).squeeze(-1)
+    log_probs_lm_rejected = torch.gather(log_probs_lm_rejected, dim=-1, index=target_rejected_ids.unsqueeze(-1)).squeeze(-1)
+    log_probs_ref_rejected = torch.gather(logits_ref_rejected, dim=-1, index=target_rejected_ids.unsqueeze(-1)).squeeze(-1)
+
+    log_probs_lm_chosen = log_probs_lm_chosen.sum()
+    log_probs_lm_rejected = log_probs_lm_rejected.sum()
+    log_probs_ref_chosen = log_probs_ref_chosen.sum()
+    log_probs_ref_rejected = log_probs_ref_rejected.sum()
+
+    log_ratio_chosen = log_probs_lm_chosen - log_probs_ref_chosen
+    log_ratio_rejected = log_probs_lm_rejected - log_probs_ref_rejected
+
+    loss = -F.logsigmoid(beta * (log_ratio_chosen - log_ratio_rejected))
+
+    return loss
